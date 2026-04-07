@@ -1,0 +1,381 @@
+BEGIN;
+
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+CREATE OR REPLACE FUNCTION set_updated_at()
+RETURNS TRIGGER AS $$
+BEGIN
+  NEW.updated_at = NOW();
+  RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+-- =========================================================
+-- LEAGUE / SEASON / PEOPLE
+-- =========================================================
+
+CREATE TABLE leagues (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE seasons (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  league_id UUID NOT NULL REFERENCES leagues(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  year INT NOT NULL,
+  start_date DATE,
+  end_date DATE,
+  status TEXT NOT NULL DEFAULT 'draft' CHECK (status IN ('draft', 'active', 'complete')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER seasons_set_updated_at
+BEFORE UPDATE ON seasons
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE teams (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  season_id UUID NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,
+  team_code TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (season_id, name),
+  UNIQUE (season_id, team_code)
+);
+
+CREATE TRIGGER teams_set_updated_at
+BEFORE UPDATE ON teams
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE players (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  first_name TEXT NOT NULL,
+  last_name TEXT NOT NULL,
+  email TEXT,
+  phone TEXT,
+  ghin_number TEXT,
+  is_active BOOLEAN NOT NULL DEFAULT TRUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER players_set_updated_at
+BEFORE UPDATE ON players
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =========================================================
+-- COURSE / NINES / TEES / HOLES
+-- =========================================================
+
+CREATE TABLE courses (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE nines (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,                -- Front / Back
+  order_no INT NOT NULL CHECK (order_no IN (1, 2)),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (course_id, name),
+  UNIQUE (course_id, order_no)
+);
+
+CREATE TABLE tees (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  course_id UUID NOT NULL REFERENCES courses(id) ON DELETE CASCADE,
+  name TEXT NOT NULL,                -- Blue / White / Gold
+  color TEXT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (course_id, name)
+);
+
+CREATE TABLE tee_nine_setup (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  tee_id UUID NOT NULL REFERENCES tees(id) ON DELETE CASCADE,
+  nine_id UUID NOT NULL REFERENCES nines(id) ON DELETE CASCADE,
+  course_rating NUMERIC(4,1) NOT NULL,
+  slope_rating INT NOT NULL CHECK (slope_rating > 0),
+  par INT NOT NULL CHECK (par > 0),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (tee_id, nine_id)
+);
+
+CREATE TABLE holes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  nine_id UUID NOT NULL REFERENCES nines(id) ON DELETE CASCADE,
+  hole_number INT NOT NULL CHECK (hole_number BETWEEN 1 AND 9),   -- 1-9 within the side
+  display_number INT NOT NULL,                                    -- actual course hole number
+  stroke_index INT NOT NULL CHECK (stroke_index BETWEEN 1 AND 9),
+  par INT NOT NULL CHECK (par BETWEEN 3 AND 6),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (nine_id, hole_number),
+  UNIQUE (nine_id, display_number),
+  UNIQUE (nine_id, stroke_index)
+);
+
+-- =========================================================
+-- ROSTER / HANDICAPS
+-- =========================================================
+
+CREATE TABLE team_roster (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  season_id UUID NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+  team_id UUID NOT NULL REFERENCES teams(id) ON DELETE CASCADE,
+  player_id UUID NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  default_slot INT CHECK (default_slot BETWEEN 1 AND 4),
+  default_tee_id UUID REFERENCES tees(id),
+  joined_at DATE,
+  left_at DATE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (season_id, team_id, player_id)
+);
+
+CREATE INDEX idx_team_roster_team_id ON team_roster(team_id);
+CREATE INDEX idx_team_roster_player_id ON team_roster(player_id);
+
+CREATE TABLE player_handicap_history (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  player_id UUID NOT NULL REFERENCES players(id) ON DELETE CASCADE,
+  effective_date DATE NOT NULL,
+  handicap_index NUMERIC(4,1) NOT NULL,
+  source TEXT NOT NULL DEFAULT 'manual' CHECK (source IN ('GHIN', 'manual', 'league')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (player_id, effective_date)
+);
+
+CREATE INDEX idx_player_handicap_history_player_date
+  ON player_handicap_history(player_id, effective_date DESC);
+
+-- =========================================================
+-- WEEKS / TEAM MATCHUPS
+-- =========================================================
+
+CREATE TABLE weeks (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  season_id UUID NOT NULL REFERENCES seasons(id) ON DELETE CASCADE,
+  week_no INT NOT NULL,
+  play_date DATE NOT NULL,
+  course_id UUID NOT NULL REFERENCES courses(id),
+  nine_id UUID NOT NULL REFERENCES nines(id),
+  status TEXT NOT NULL DEFAULT 'scheduled'
+    CHECK (status IN ('scheduled', 'open', 'locked', 'finalized')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (season_id, week_no)
+);
+
+CREATE TRIGGER weeks_set_updated_at
+BEFORE UPDATE ON weeks
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE TABLE team_matchups (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  week_id UUID NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
+  team_a_id UUID NOT NULL REFERENCES teams(id),
+  team_b_id UUID NOT NULL REFERENCES teams(id),
+  team_a_points NUMERIC(4,1) NOT NULL DEFAULT 0,
+  team_b_points NUMERIC(4,1) NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'scheduled'
+    CHECK (status IN ('scheduled', 'in_progress', 'final')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  CHECK (team_a_id <> team_b_id),
+  UNIQUE (week_id, team_a_id, team_b_id)
+);
+
+CREATE TRIGGER team_matchups_set_updated_at
+BEFORE UPDATE ON team_matchups
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE INDEX idx_team_matchups_week_id ON team_matchups(week_id);
+
+-- =========================================================
+-- LINEUPS / INDIVIDUAL MATCHES / HOLE SCORES
+-- =========================================================
+
+CREATE TABLE lineups (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  team_matchup_id UUID NOT NULL REFERENCES team_matchups(id) ON DELETE CASCADE,
+  team_id UUID NOT NULL REFERENCES teams(id),
+  slot INT NOT NULL CHECK (slot BETWEEN 1 AND 4),
+  player_id UUID NOT NULL REFERENCES players(id),
+  tee_id UUID NOT NULL REFERENCES tees(id),
+
+  -- snapshot values used that night
+  handicap_index NUMERIC(4,1) NOT NULL,
+  course_handicap INT NOT NULL,
+  playing_handicap INT NOT NULL,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (team_matchup_id, team_id, slot),
+  UNIQUE (team_matchup_id, player_id)
+);
+
+CREATE INDEX idx_lineups_team_matchup_id ON lineups(team_matchup_id);
+CREATE INDEX idx_lineups_player_id ON lineups(player_id);
+
+CREATE TABLE individual_matches (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  team_matchup_id UUID NOT NULL REFERENCES team_matchups(id) ON DELETE CASCADE,
+  slot INT NOT NULL CHECK (slot BETWEEN 1 AND 4),
+
+  lineup_a_id UUID NOT NULL REFERENCES lineups(id) ON DELETE CASCADE,
+  lineup_b_id UUID NOT NULL REFERENCES lineups(id) ON DELETE CASCADE,
+
+  player_a_id UUID NOT NULL REFERENCES players(id),
+  player_b_id UUID NOT NULL REFERENCES players(id),
+
+  tee_a_id UUID NOT NULL REFERENCES tees(id),
+  tee_b_id UUID NOT NULL REFERENCES tees(id),
+
+  handicap_index_a NUMERIC(4,1) NOT NULL,
+  handicap_index_b NUMERIC(4,1) NOT NULL,
+
+  course_handicap_a INT NOT NULL,
+  course_handicap_b INT NOT NULL,
+
+  playing_handicap_a INT NOT NULL,
+  playing_handicap_b INT NOT NULL,
+
+  strokes_received_a INT NOT NULL DEFAULT 0 CHECK (strokes_received_a >= 0),
+  strokes_received_b INT NOT NULL DEFAULT 0 CHECK (strokes_received_b >= 0),
+
+  hole_points_a NUMERIC(4,1) NOT NULL DEFAULT 0,
+  hole_points_b NUMERIC(4,1) NOT NULL DEFAULT 0,
+
+  bonus_point_a NUMERIC(3,1) NOT NULL DEFAULT 0,
+  bonus_point_b NUMERIC(3,1) NOT NULL DEFAULT 0,
+
+  total_points_a NUMERIC(4,1) NOT NULL DEFAULT 0,
+  total_points_b NUMERIC(4,1) NOT NULL DEFAULT 0,
+
+  match_winner_player_id UUID REFERENCES players(id),
+  status TEXT NOT NULL DEFAULT 'scheduled'
+    CHECK (status IN ('scheduled', 'entered', 'final')),
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+
+  CHECK (player_a_id <> player_b_id),
+  CHECK (lineup_a_id <> lineup_b_id),
+  UNIQUE (team_matchup_id, slot)
+);
+
+CREATE TRIGGER individual_matches_set_updated_at
+BEFORE UPDATE ON individual_matches
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+CREATE INDEX idx_individual_matches_team_matchup_id ON individual_matches(team_matchup_id);
+
+CREATE TABLE match_holes (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  individual_match_id UUID NOT NULL REFERENCES individual_matches(id) ON DELETE CASCADE,
+  hole_number INT NOT NULL CHECK (hole_number BETWEEN 1 AND 9),
+
+  player_a_gross INT CHECK (player_a_gross >= 1),
+  player_b_gross INT CHECK (player_b_gross >= 1),
+
+  player_a_strokes_received INT DEFAULT 0 CHECK (player_a_strokes_received >= 0),
+  player_b_strokes_received INT DEFAULT 0 CHECK (player_b_strokes_received >= 0),
+
+  player_a_net INT CHECK (player_a_net >= 1),
+  player_b_net INT CHECK (player_b_net >= 1),
+
+  points_a NUMERIC(3,1) NOT NULL DEFAULT 0,
+  points_b NUMERIC(3,1) NOT NULL DEFAULT 0,
+
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  UNIQUE (individual_match_id, hole_number)
+);
+
+CREATE INDEX idx_match_holes_individual_match_id ON match_holes(individual_match_id);
+
+-- =========================================================
+-- SEASON SETTINGS
+-- =========================================================
+
+CREATE TABLE league_settings (
+  id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  season_id UUID NOT NULL UNIQUE REFERENCES seasons(id) ON DELETE CASCADE,
+  points_per_hole_win NUMERIC(3,1) NOT NULL DEFAULT 1.0,
+  points_per_hole_tie NUMERIC(3,1) NOT NULL DEFAULT 0.5,
+  match_win_bonus NUMERIC(3,1) NOT NULL DEFAULT 1.0,
+  handicap_method TEXT NOT NULL DEFAULT 'USGA',
+  handicap_allowance_pct NUMERIC(5,2) NOT NULL DEFAULT 100.00,
+  max_strokes_per_hole INT,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TRIGGER league_settings_set_updated_at
+BEFORE UPDATE ON league_settings
+FOR EACH ROW EXECUTE FUNCTION set_updated_at();
+
+-- =========================================================
+-- LOOKUP VIEWS
+-- These make it easier to see IDs without hand-juggling UUIDs
+-- =========================================================
+
+CREATE OR REPLACE VIEW v_course_lookup AS
+SELECT id, name
+FROM courses
+ORDER BY name;
+
+CREATE OR REPLACE VIEW v_nine_lookup AS
+SELECT
+  n.id,
+  n.course_id,
+  c.name AS course_name,
+  n.name AS nine_name,
+  n.order_no
+FROM nines n
+JOIN courses c ON c.id = n.course_id
+ORDER BY c.name, n.order_no;
+
+CREATE OR REPLACE VIEW v_tee_lookup AS
+SELECT
+  t.id,
+  t.course_id,
+  c.name AS course_name,
+  t.name AS tee_name,
+  t.color
+FROM tees t
+JOIN courses c ON c.id = t.course_id
+ORDER BY c.name, t.name;
+
+CREATE OR REPLACE VIEW v_tee_nine_lookup AS
+SELECT
+  tns.id,
+  tns.tee_id,
+  tns.nine_id,
+  c.name AS course_name,
+  t.name AS tee_name,
+  t.color,
+  n.name AS nine_name,
+  n.order_no,
+  tns.course_rating,
+  tns.slope_rating,
+  tns.par
+FROM tee_nine_setup tns
+JOIN tees t ON t.id = tns.tee_id
+JOIN nines n ON n.id = tns.nine_id
+JOIN courses c ON c.id = t.course_id
+ORDER BY c.name, t.name, n.order_no;
+
+CREATE OR REPLACE VIEW v_player_latest_handicap AS
+SELECT DISTINCT ON (ph.player_id)
+  ph.player_id,
+  ph.effective_date,
+  ph.handicap_index,
+  ph.source
+FROM player_handicap_history ph
+ORDER BY ph.player_id, ph.effective_date DESC, ph.created_at DESC;
+
+COMMIT;
